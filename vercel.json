@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/order-webhook.js": {
+      "maxDuration": 10
+    }
+  }
+}
