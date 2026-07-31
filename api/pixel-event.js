@@ -133,6 +133,13 @@ module.exports = async function handler(req, res) {
   // - { source: "pixel", customData: {...Shiprocket PurchaseSR payload...} }
   // - { ...Shiprocket PurchaseSR payload... }
   const d = body?.customData && typeof body.customData === "object" ? body.customData : body || {};
+  
+const eventName =
+  body?.event_name ||
+  (body?.source === "add_to_cart"
+    ? "AddToCart"
+    : "Purchase");
+
 
   const items = Array.isArray(d?.items)
     ? d.items
@@ -152,12 +159,22 @@ module.exports = async function handler(req, res) {
     return;
   }
 
-  const supplementValueNumber = supplementItems.reduce((sum, item) => {
-    const price = Number.parseFloat(item?.price ?? item?.item_price);
-    const qty = Number(item?.quantity) || 0;
-    if (!Number.isFinite(price) || qty <= 0) return sum;
-    return sum + price * qty;
-  }, 0);
+ const supplementValueNumber = supplementItems.reduce((sum, item) => {
+
+  const price = Number.parseFloat(
+    item?.price ??
+    item?.item_price ??
+    0
+  );
+
+  const qty = Number(item?.quantity || 1);
+
+  if (!Number.isFinite(price)) return sum;
+
+  return sum + (price * qty);
+
+},0);
+
   const supplementValue = Number.isFinite(supplementValueNumber)
     ? supplementValueNumber
     : 0;
@@ -200,7 +217,12 @@ module.exports = async function handler(req, res) {
   const hashedCountry = sha256Hex("in");
   const hashedExternalId = sha256Hex(d?.customer_id || d?.user_id);
 
-  const sourceUrl = pickFirst(d?.landing_page, d?.landing_site, d?.url);
+  const sourceUrl = pickFirst(
+  d?.landing_page,
+  d?.landing_site,
+  d?.url,
+  d?.page_location
+);
   const fbclid = pickFirst(
     d?.fbclid,
     getUrlParam(sourceUrl, "fbclid"),
@@ -209,14 +231,32 @@ module.exports = async function handler(req, res) {
   const fbc = pickFirst(d?.fbc, d?._fbc, normalizeFbc(fbclid));
   const fbp = pickFirst(d?.fbp, d?._fbp);
 
-  const orderId =
-    d?.transaction_id || d?.order_id || d?.orderId || d?.id || "pixel";
-  const eventId = `supp_pixel_${String(orderId)}_${Date.now()}`;
+const orderId =
+  d?.transaction_id ||
+  d?.order_id ||
+  d?.orderId ||
+  d?.cart_token ||
+  d?.token ||
+  d?.checkout_token ||
+  d?.checkout_id ||
+  d?.id ||
+  crypto.randomUUID();
+
+
+const eventPrefix = eventName
+  .replace(/\s+/g,"_")
+  .replace(/[^a-zA-Z0-9_]/g,"")
+  .toLowerCase();
+
+const eventId = `${eventPrefix}_${String(orderId)}_${Date.now()}`;
+
+
+
 
   const payload = {
     data: [
       {
-        event_name: "Supplement Purchase",
+        event_name: eventName,
         event_time: Math.floor(Date.now() / 1000),
         action_source: "website",
         event_id: eventId,
@@ -234,25 +274,39 @@ module.exports = async function handler(req, res) {
             : {}),
           ...(headerIp ? { client_ip_address: headerIp } : {}),
           ...(fbc ? { fbc: String(fbc) } : {}),
-          ...(fbp ? { fbp: String(fbp) } : {}),
+...(fbp ? { fbp: String(fbp) } : {}),
+...(body?.fbp ? { fbp: body.fbp } : {}),
+...(body?.fbc ? { fbc: body.fbc } : {}),
+          
         },
         ...(sourceUrl ? { event_source_url: String(sourceUrl) } : {}),
         custom_data: {
           currency: d?.currency || "INR",
-          value: supplementValue.toFixed(2),
+          value: Number(supplementValue).toFixed(2),
           content_type: "product",
-          content_name: "Supplement Purchase",
-          content_category: "Health Supplements",
-          contents: supplementItems.map((item) => ({
-            id: String(item?.id),
-            quantity: Number(item?.quantity) || 0,
-            item_price: Number.parseFloat(item?.price ?? item?.item_price) || 0,
-            title: item?.name || item?.title,
-          })),
+  content_name:
+  body?.source === "add_to_cart"
+    ? "Supplement Add To Cart"
+    : "Supplement Purchase",
+          content_category:"Health Supplements",
+         contents: supplementItems.map(item => ({
+
+  id: String(item.id),
+
+  quantity: Number(item.quantity || 1),
+
+  item_price:
+    Number.parseFloat(item.price ?? item.item_price ?? 0),
+
+  title:
+    item.name ||
+    item.title ||
+    "Supplement"
+
+})),
           num_items: supplementItems.reduce(
-            (s, i) => s + (Number(i?.quantity) || 0),
-            0
-          ),
+  (s,i)=>s+(Number(i.quantity||1)),
+0),
           order_id: String(orderId),
         },
       },
