@@ -1,8 +1,14 @@
 // Shopify Custom Pixel forwarder endpoint -> Meta CAPI
 // - No Shopify signature verification (non-sensitive backup/parallel signal)
-// - Expects payload: { source: "pixel", customData: {...} }
+// - Expects payload: { source: "pixel" | "add_to_cart", customData: {...} }
+//
+// LOGGING: every request prints a line tagged [SupplementTracker] with a short
+// reqId so you can trace one request end-to-end in Vercel logs. No PII is logged
+// (only which match keys were present, never their values).
 
 const crypto = require("crypto");
+
+const LOG = "[SupplementTracker]";
 
 const DEFAULT_SUPPLEMENT_PRODUCT_IDS = [
   "8075024990397",
@@ -99,6 +105,9 @@ async function sendToMetaCapi({ pixelId, payload }) {
 }
 
 module.exports = async function handler(req, res) {
+  // Short id to correlate all log lines for this one request
+  const reqId = crypto.randomUUID().slice(0, 8);
+
   if (req.method !== "POST") {
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
@@ -116,6 +125,7 @@ module.exports = async function handler(req, res) {
   try {
     body = await getJson(req);
   } catch {
+    console.warn(`${LOG} INVALID_JSON`, { reqId });
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
     res.end(JSON.stringify({ status: "ok", note: "invalid_json" }));
@@ -133,13 +143,10 @@ module.exports = async function handler(req, res) {
   // - { source: "pixel", customData: {...Shiprocket PurchaseSR payload...} }
   // - { ...Shiprocket PurchaseSR payload... }
   const d = body?.customData && typeof body.customData === "object" ? body.customData : body || {};
-  
-const eventName =
-  body?.event_name ||
-  (body?.source === "add_to_cart"
-    ? "AddToCart"
-    : "Purchase");
 
+  const eventName =
+    body?.event_name ||
+    (body?.source === "add_to_cart" ? "AddToCart" : "Purchase");
 
   const items = Array.isArray(d?.items)
     ? d.items
@@ -152,28 +159,34 @@ const eventName =
     return supplementIdSet.has(id);
   });
 
+  // ── LOG 1: what came in ─────────────────────────────────────────────
+  console.log(`${LOG} RECEIVED`, {
+    reqId,
+    source: body?.source || "(none)",
+    resolved_event: eventName,
+    items_total: items.length,
+    items_supplement: supplementItems.length,
+  });
+
   if (supplementItems.length === 0) {
+    // LOG: skipped — show the ids we saw so you can spot GID/format mismatches
+    console.log(`${LOG} SKIPPED (no supplement items matched)`, {
+      reqId,
+      resolved_event: eventName,
+      ids_seen: items.map((i) => (i?.id != null ? String(i.id) : "(none)")),
+    });
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
     res.end(JSON.stringify({ status: "skipped" }));
     return;
   }
 
- const supplementValueNumber = supplementItems.reduce((sum, item) => {
-
-  const price = Number.parseFloat(
-    item?.price ??
-    item?.item_price ??
-    0
-  );
-
-  const qty = Number(item?.quantity || 1);
-
-  if (!Number.isFinite(price)) return sum;
-
-  return sum + (price * qty);
-
-},0);
+  const supplementValueNumber = supplementItems.reduce((sum, item) => {
+    const price = Number.parseFloat(item?.price ?? item?.item_price ?? 0);
+    const qty = Number(item?.quantity || 1);
+    if (!Number.isFinite(price)) return sum;
+    return sum + price * qty;
+  }, 0);
 
   const supplementValue = Number.isFinite(supplementValueNumber)
     ? supplementValueNumber
@@ -182,6 +195,11 @@ const eventName =
   const pixelId = process.env.META_PIXEL_ID;
   const accessToken = process.env.META_CAPI_TOKEN;
   if (!pixelId || !accessToken) {
+    console.warn(`${LOG} MISSING_ENV (META_PIXEL_ID / META_CAPI_TOKEN not set)`, {
+      reqId,
+      has_pixel_id: !!pixelId,
+      has_token: !!accessToken,
+    });
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
     res.end(JSON.stringify({ status: "ok", note: "missing_meta_env" }));
@@ -218,11 +236,11 @@ const eventName =
   const hashedExternalId = sha256Hex(d?.customer_id || d?.user_id);
 
   const sourceUrl = pickFirst(
-  d?.landing_page,
-  d?.landing_site,
-  d?.url,
-  d?.page_location
-);
+    d?.landing_page,
+    d?.landing_site,
+    d?.url,
+    d?.page_location
+  );
   const fbclid = pickFirst(
     d?.fbclid,
     getUrlParam(sourceUrl, "fbclid"),
@@ -231,27 +249,23 @@ const eventName =
   const fbc = pickFirst(d?.fbc, d?._fbc, normalizeFbc(fbclid));
   const fbp = pickFirst(d?.fbp, d?._fbp);
 
-const orderId =
-  d?.transaction_id ||
-  d?.order_id ||
-  d?.orderId ||
-  d?.cart_token ||
-  d?.token ||
-  d?.checkout_token ||
-  d?.checkout_id ||
-  d?.id ||
-  crypto.randomUUID();
+  const orderId =
+    d?.transaction_id ||
+    d?.order_id ||
+    d?.orderId ||
+    d?.cart_token ||
+    d?.token ||
+    d?.checkout_token ||
+    d?.checkout_id ||
+    d?.id ||
+    crypto.randomUUID();
 
+  const eventPrefix = eventName
+    .replace(/\s+/g, "_")
+    .replace(/[^a-zA-Z0-9_]/g, "")
+    .toLowerCase();
 
-const eventPrefix = eventName
-  .replace(/\s+/g,"_")
-  .replace(/[^a-zA-Z0-9_]/g,"")
-  .toLowerCase();
-
-const eventId = `${eventPrefix}_${String(orderId)}_${Date.now()}`;
-
-
-
+  const eventId = `${eventPrefix}_${String(orderId)}_${Date.now()}`;
 
   const payload = {
     data: [
@@ -274,39 +288,30 @@ const eventId = `${eventPrefix}_${String(orderId)}_${Date.now()}`;
             : {}),
           ...(headerIp ? { client_ip_address: headerIp } : {}),
           ...(fbc ? { fbc: String(fbc) } : {}),
-...(fbp ? { fbp: String(fbp) } : {}),
-...(body?.fbp ? { fbp: body.fbp } : {}),
-...(body?.fbc ? { fbc: body.fbc } : {}),
-          
+          ...(fbp ? { fbp: String(fbp) } : {}),
+          ...(body?.fbp ? { fbp: body.fbp } : {}),
+          ...(body?.fbc ? { fbc: body.fbc } : {}),
         },
         ...(sourceUrl ? { event_source_url: String(sourceUrl) } : {}),
         custom_data: {
           currency: d?.currency || "INR",
           value: Number(supplementValue).toFixed(2),
           content_type: "product",
-  content_name:
-  body?.source === "add_to_cart"
-    ? "Supplement Add To Cart"
-    : "Supplement Purchase",
-          content_category:"Health Supplements",
-         contents: supplementItems.map(item => ({
-
-  id: String(item.id),
-
-  quantity: Number(item.quantity || 1),
-
-  item_price:
-    Number.parseFloat(item.price ?? item.item_price ?? 0),
-
-  title:
-    item.name ||
-    item.title ||
-    "Supplement"
-
-})),
+          content_name:
+            body?.source === "add_to_cart"
+              ? "Supplement Add To Cart"
+              : "Supplement Purchase",
+          content_category: "Health Supplements",
+          contents: supplementItems.map((item) => ({
+            id: String(item.id),
+            quantity: Number(item.quantity || 1),
+            item_price: Number.parseFloat(item.price ?? item.item_price ?? 0),
+            title: item.name || item.title || "Supplement",
+          })),
           num_items: supplementItems.reduce(
-  (s,i)=>s+(Number(i.quantity||1)),
-0),
+            (s, i) => s + Number(i.quantity || 1),
+            0
+          ),
           order_id: String(orderId),
         },
       },
@@ -319,17 +324,45 @@ const eventId = `${eventPrefix}_${String(orderId)}_${Date.now()}`;
     payload.test_event_code = process.env.META_TEST_EVENT_CODE;
   }
 
+  // ── LOG 2: exactly what we're about to send (match_keys = which identifiers
+  //           were present, so you can gauge match quality without seeing PII) ──
+  console.log(`${LOG} SENDING`, {
+    reqId,
+    event_name: eventName,
+    content_name: payload.data[0].custom_data.content_name,
+    event_id: eventId,
+    value: payload.data[0].custom_data.value,
+    currency: payload.data[0].custom_data.currency,
+    num_items: payload.data[0].custom_data.num_items,
+    match_keys: Object.keys(payload.data[0].user_data),
+    test_event: !!process.env.META_TEST_EVENT_CODE,
+  });
+
+  let metaResult = null;
   try {
-    const result = await sendToMetaCapi({ pixelId, payload });
-    if (!result.ok) {
-      console.error("[SupplementTracker] Pixel Meta CAPI error", {
-        status: result.status,
-        error: result.json?.error || result.json,
+    metaResult = await sendToMetaCapi({ pixelId, payload });
+    if (metaResult.ok) {
+      // ── LOG 3a: Meta accepted it. events_received:1 = success. ──
+      console.log(`${LOG} META_OK`, {
+        reqId,
+        event_name: eventName,
+        event_id: eventId,
+        events_received: metaResult.json?.events_received,
+        fbtrace_id: metaResult.json?.fbtrace_id,
+        messages: metaResult.json?.messages,
+      });
+    } else {
+      // ── LOG 3b: Meta rejected it. Read error for the reason. ──
+      console.error(`${LOG} META_ERROR`, {
+        reqId,
+        status: metaResult.status,
+        error: metaResult.json?.error || metaResult.json,
         event_id: eventId,
       });
     }
   } catch (e) {
-    console.error("[SupplementTracker] Pixel Meta CAPI request failed", {
+    console.error(`${LOG} REQUEST_FAILED`, {
+      reqId,
       message: e?.message,
       event_id: eventId,
     });
@@ -337,5 +370,13 @@ const eventId = `${eventPrefix}_${String(orderId)}_${Date.now()}`;
 
   res.statusCode = 200;
   res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ status: "ok" }));
+  res.end(
+    JSON.stringify({
+      status: "ok",
+      reqId,
+      event_name: eventName,
+      event_id: eventId,
+      events_received: metaResult?.json?.events_received ?? null,
+    })
+  );
 };
