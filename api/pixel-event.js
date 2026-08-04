@@ -10,6 +10,10 @@ const crypto = require("crypto");
 
 const LOG = "[SupplementTracker]";
 
+// Set your live store origin here. Use "*" temporarily if testing from
+// multiple domains (staging, preview URLs), then lock it back down.
+const ALLOWED_ORIGIN = "https://store.aayushwellness.com";
+
 const DEFAULT_SUPPLEMENT_PRODUCT_IDS = [
   "8075024990397",
   "8075025121469",
@@ -108,6 +112,17 @@ module.exports = async function handler(req, res) {
   // Short id to correlate all log lines for this one request
   const reqId = crypto.randomUUID().slice(0, 8);
 
+  // ── CORS: must be set on EVERY response, including preflight ──────────
+  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
+
   if (req.method !== "POST") {
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
@@ -144,9 +159,11 @@ module.exports = async function handler(req, res) {
   // - { ...Shiprocket PurchaseSR payload... }
   const d = body?.customData && typeof body.customData === "object" ? body.customData : body || {};
 
+  // ── EVENT NAME: gives AddToCart its own row in Events Manager,
+  //    separate from "Supplement Purchase" and from the general ATC event ──
   const eventName =
     body?.event_name ||
-    (body?.source === "add_to_cart" ? "AddToCart" : "Purchase");
+    (body?.source === "add_to_cart" ? "Supplement AddToCart" : "Supplement Purchase");
 
   const items = Array.isArray(d?.items)
     ? d.items
